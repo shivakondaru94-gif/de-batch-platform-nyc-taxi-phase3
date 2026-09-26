@@ -1,0 +1,45 @@
+[ingest] yellow_tripdata_2024-01.parquet already present - skipping (idempotent)
+
+[bronze->silver] reading raw month
+  rows_in = 2,964,624
+
+  rejections per rule (a row may violate several):
+    null_timestamp                   0  ( 0.00%)
+    month_mismatch                  18  ( 0.00%)
+    nonpositive_duration        35,121  ( 1.18%)
+    implausible_duration         1,814  ( 0.06%)
+    implausible_distance        69,798  ( 2.35%)
+    negative_fare               37,448  ( 1.26%)
+    implausible_fare                 7  ( 0.00%)
+    invalid_zone                     0  ( 0.00%)
+
+  rows_quarantined = 106,976 (3.61%)
+  duplicates removed = 3
+  rows_out (silver)  = 2,857,645
+
+[silver->gold] hourly tumbling windows per pickup zone
+
+  feature_rows = 73,267
+  zones        = 257
+  first_window = 2024-01-01 00:00:00
+  last_window  = 2024-01-31 23:00:00
+  weekend rows = 17,982
+
+  sample of the delivered feature table:
+ pickup_zone_id        window_start  trip_count  avg_trip_distance  avg_fare_amount  avg_duration_min  p90_duration_min  hour_of_day  day_of_week  is_weekend
+            161 2024-01-24 18:00:00         720           1.710236        13.996097         14.381134         23.458333           18            4       False
+            161 2024-01-18 18:00:00         701           2.078773        14.850556         14.826391         23.716667           18            5       False
+            161 2024-01-17 19:00:00         680           2.039206        13.790221         12.727696         20.103333           19            4       False
+             79 2024-01-28 01:00:00         668           2.439192        14.728503         12.399326         21.436667            1            1        True
+            142 2024-01-04 22:00:00         662           2.402251        14.293459         11.639552         19.511667           22            5       False
+            161 2024-01-30 20:00:00         657           2.167565        13.712801         12.045282         20.283333           20            3       False
+            161 2024-01-09 18:00:00         653           1.797060        13.605881         12.665314         19.943333           18            3       False
+            161 2024-01-17 18:00:00         651           1.868771        13.929355         13.359780         21.433333           18            4       False
+
+[verify] post-load assertions
+    row_count_positive     PASS
+    no_null_zones          PASS
+    no_negative_counts     PASS
+    unique_zone_window     PASS
+
+wrote gold_features_sample.csv (73,267 rows)

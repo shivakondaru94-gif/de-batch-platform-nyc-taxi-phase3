@@ -1,0 +1,10 @@
+# Host-side Python dependencies: NOT needed to run the platform, which runs
+# entirely in containers. Needed only for the independent verification scripts
+# (verification/) and for regenerating the architecture diagram (docs/).
+#
+#   pip install -r requirements-dev.txt
+pandas==3.0.3          # verification/verify_logic.py, verification/full_year.py
+pyarrow==22.0.0        # Parquet reader for pandas
+requests==2.32.3       # downloading the TLC source files
+PyYAML==6.0.1          # validating the compose specifications
+matplotlib==3.11.1     # docs/make_architecture_diagram.py

@@ -1,0 +1,7 @@
+# Python dependencies installed into the Airflow image (see airflow/Dockerfile).
+# The base image apache/airflow:2.9.3-python3.11 supplies Airflow itself.
+# Every version is pinned so the image builds identically on any machine.
+apache-airflow-providers-apache-spark==4.8.1   # SparkSubmitOperator
+apache-airflow-providers-postgres==5.11.1      # PostgresHook for lineage/quality
+boto3==1.34.162                                # ingestion -> MinIO (S3 API)
+requests==2.32.3                               # ingestion: download from TLC

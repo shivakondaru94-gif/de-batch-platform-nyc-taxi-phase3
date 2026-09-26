@@ -1,0 +1,298 @@
+# A Reproducible Batch Data Architecture for Quarterly ML Feature Generation
+# on Urban Mobility Data
+#
+# Every component is an isolated microservice on a private bridge network.
+# The whole platform is declared here as Infrastructure as Code: `make up`
+# on any machine with Docker reproduces the identical environment.
+#
+# SECURITY POSTURE (threat model in docs/security.md)
+#   * no service publishes on 0.0.0.0 - operator interfaces are bound to
+#     127.0.0.1, so nothing is reachable from the local network
+#   * the data stores publish no host port at all; they are reachable only
+#     from inside the compose network
+#   * every container runs with no-new-privileges and a minimal capability set
+#   * every container has CPU and memory limits, bounding a runaway or
+#     hostile workload
+#   * all images are pinned to an exact tag, never to a floating one
+
+name: de-batch-platform
+
+# ---------------------------------------------------------------------------
+# Shared fragments. Defining the hardening once means a new service cannot
+# quietly be added without it.
+# ---------------------------------------------------------------------------
+x-hardening: &hardening
+  security_opt:
+    - no-new-privileges:true
+  restart: unless-stopped
+
+x-spark-common: &spark-common
+  <<: *hardening
+  build:
+    context: ./spark
+  networks: [platform]
+  volumes:
+    - ./spark/jobs:/opt/jobs:ro
+  env_file: .env
+  cap_drop: [ALL]
+  deploy:
+    resources:
+      limits:
+        cpus: "2.0"
+        memory: 3G
+
+services:
+
+  # ---------------------------------------------------------------- storage --
+  # MinIO is the data lake (S3-compatible object store). It replaces HDFS:
+  # same role, a fraction of the memory footprint, and identical S3A access
+  # paths, so the Spark jobs would run unchanged against real S3.
+  minio:
+    <<: *hardening
+    # Pulled from the vendor's quay.io mirror: MinIO withdrew public pulls
+    # from Docker Hub during the project (anonymous pulls now return 401).
+    # Same release tag, same image, different registry.
+    image: quay.io/minio/minio:RELEASE.2024-09-13T20-26-02Z
+    container_name: minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_BROWSER_REDIRECT_URL: http://127.0.0.1:9001
+    ports:
+      # Console only, and only on the loopback interface. The S3 API port is
+      # deliberately NOT published: only containers on the platform network
+      # may reach the lake.
+      - "127.0.0.1:9001:9001"
+    volumes:
+      - minio-data:/data
+    networks: [platform]
+    cap_drop: [ALL]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+
+  # One-shot bootstrap: creates the medallion buckets and a scoped service
+  # account so that no component ever authenticates as the MinIO root user.
+  minio-init:
+    image: quay.io/minio/mc:RELEASE.2024-09-16T17-43-14Z
+    container_name: minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      # The client stores its alias configuration under $HOME. This image
+      # runs as an unprivileged user with no writable home, so the config is
+      # pointed at /tmp rather than granting the container root.
+      HOME: /tmp
+      MC_CONFIG_DIR: /tmp/.mc
+    entrypoint: /bin/sh
+    # Invoked via sh, not executed directly: a repository cloned from a
+    # filesystem without POSIX permission bits (Windows) has no execute bit
+    # on the script, and running it directly then fails with permission denied.
+    command: -c "sh /scripts/bootstrap.sh"
+    volumes:
+      - ./serving/bootstrap.sh:/scripts/bootstrap.sh:ro
+    networks: [platform]
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    restart: "no"
+
+  # ---------------------------------------------------------------- serving --
+  # Gold-layer feature store: the only surface the (out-of-scope) machine
+  # learning application reads from. No host port is published; a consuming
+  # application is expected to join the platform network.
+  warehouse:
+    <<: *hardening
+    image: postgres:16-alpine
+    container_name: warehouse
+    environment:
+      POSTGRES_USER: ${WAREHOUSE_USER}
+      POSTGRES_PASSWORD: ${WAREHOUSE_PASSWORD}
+      POSTGRES_DB: ${WAREHOUSE_DB}
+    volumes:
+      - warehouse-data:/var/lib/postgresql/data
+      - ./serving/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks: [platform]
+    # Postgres needs these to drop privileges during initdb; everything else
+    # is removed. Dropping ALL without them breaks first-boot initialisation.
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${WAREHOUSE_USER} -d ${WAREHOUSE_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+
+  # ------------------------------------------------------------- processing --
+  # Spark standalone cluster. Scalability is horizontal and demonstrable:
+  # `docker compose up --scale spark-worker=4` adds capacity with no code change.
+  spark-master:
+    <<: *spark-common
+    container_name: spark-master
+    hostname: spark-master
+    environment:
+      SPARK_MODE: master
+      # The image runs under a uid with no /etc/passwd entry, so Hadoop's
+      # OS-level user lookup returns null and the login module throws. Naming
+      # the user explicitly avoids the lookup entirely.
+      HADOOP_USER_NAME: spark
+      HOME: /tmp
+    ports:
+      - "127.0.0.1:8081:8080"   # Spark master UI, loopback only
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  spark-worker:
+    <<: *spark-common
+    environment:
+      SPARK_MODE: worker
+      HADOOP_USER_NAME: spark
+      HOME: /tmp
+      SPARK_MASTER_URL: spark://spark-master:7077
+      SPARK_WORKER_CORES: ${SPARK_WORKER_CORES}
+      SPARK_WORKER_MEMORY: ${SPARK_WORKER_MEMORY}
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 3G
+
+  # ---------------------------------------------------------- orchestration --
+  # Airflow owns the schedule (monthly ingest, quarterly aggregate), retries,
+  # backfills and lineage metadata. Its own metadata database is kept separate
+  # from the serving warehouse so the two concerns fail independently.
+  airflow-db:
+    <<: *hardening
+    image: postgres:16-alpine
+    container_name: airflow-db
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD}
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow-db-data:/var/lib/postgresql/data
+    networks: [platform]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+
+  airflow-init:
+    build:
+      context: ./airflow
+    container_name: airflow-init
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+    env_file: .env
+    environment: &airflow-env
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:${AIRFLOW_DB_PASSWORD}@airflow-db/airflow
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"  # no manual unpause
+      AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "false"
+      # Connections the DAGs reference, injected rather than clicked into the
+      # UI, so a rebuilt platform is immediately operational.
+      AIRFLOW_CONN_SPARK_DEFAULT: spark://spark-master:7077
+      AIRFLOW_CONN_WAREHOUSE: postgresql://${WAREHOUSE_USER}:${WAREHOUSE_PASSWORD}@warehouse:5432/${WAREHOUSE_DB}
+    entrypoint: /bin/bash
+    command: -c "airflow db migrate &&
+                 airflow users create --username ${AIRFLOW_ADMIN_USER}
+                   --password ${AIRFLOW_ADMIN_PASSWORD} --firstname admin
+                   --lastname admin --role Admin --email admin@example.com || true"
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags:ro
+      - ./airflow/logs:/opt/airflow/logs
+    networks: [platform]
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    restart: "no"
+
+  airflow-webserver:
+    <<: *hardening
+    build:
+      context: ./airflow
+    container_name: airflow-webserver
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    env_file: .env
+    environment: *airflow-env
+    command: webserver
+    ports:
+      - "127.0.0.1:8080:8080"   # operator UI, loopback only
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags:ro
+      - ./airflow/logs:/opt/airflow/logs
+      - ./spark/jobs:/opt/jobs:ro
+    networks: [platform]
+    cap_drop: [ALL]
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 2G
+
+  airflow-scheduler:
+    <<: *hardening
+    build:
+      context: ./airflow
+    container_name: airflow-scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    env_file: .env
+    environment: *airflow-env
+    command: scheduler
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags:ro
+      - ./airflow/logs:/opt/airflow/logs
+      - ./spark/jobs:/opt/jobs:ro
+      - ./ingestion:/opt/ingestion:ro
+    networks: [platform]
+    cap_drop: [ALL]
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 3G
+
+networks:
+  platform:
+    driver: bridge
+
+volumes:
+  minio-data:
+  warehouse-data:
+  airflow-db-data:

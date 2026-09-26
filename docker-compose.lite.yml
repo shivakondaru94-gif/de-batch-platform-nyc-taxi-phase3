@@ -1,0 +1,70 @@
+# Lightweight profile for a 16 GB cloud development machine
+# (GitHub Codespaces, Cloud Shell, a small VM).
+#
+# Applied on top of docker-compose.yml:
+#
+#     docker compose -f docker-compose.yml -f docker-compose.lite.yml up -d
+#     make up-lite
+#
+# The base file is sized for a 16 GB laptop where the platform is the only
+# workload. In a cloud editor the environment itself takes several gigabytes,
+# so the limits are cut and the cluster runs a single worker. Nothing about
+# the architecture changes: worker count is a replica setting, which is the
+# scalability property the design claims.
+
+services:
+
+  minio:
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+
+  warehouse:
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+
+  airflow-db:
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+
+  airflow-webserver:
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 1G
+
+  airflow-scheduler:
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 2G
+
+  spark-master:
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 1G
+
+  spark-worker:
+    environment:
+      SPARK_MODE: worker
+      SPARK_MASTER_URL: spark://spark-master:7077
+      SPARK_WORKER_CORES: 2
+      SPARK_WORKER_MEMORY: 2G
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 3G
